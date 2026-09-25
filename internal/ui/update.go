@@ -6,69 +6,52 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/sudo-adduser-jordan/lazynmap/internal/history"
 	"github.com/sudo-adduser-jordan/lazynmap/internal/nmap"
 )
-
-type historyItem struct {
-	entry history.Entry
-}
-
-func (i historyItem) Title() string {
-	target := i.entry.Target
-	if target == "" {
-		target = "unknown target"
-	}
-	return fmt.Sprintf("%s  %s", target, i.entry.ProfileName)
-}
-
-func (i historyItem) Description() string {
-	finished := i.entry.FinishedAt
-	if finished.IsZero() {
-		finished = i.entry.Result.FinishedAt
-	}
-	openPorts := openPortCount(i.entry.Result.Scan.Hosts)
-	return fmt.Sprintf("%s  ·  %d host(s)  ·  %d open", finished.Local().Format("Jan 02 15:04"), len(i.entry.Result.Scan.Hosts), openPorts)
-}
-
-func (i historyItem) FilterValue() string {
-	return strings.Join([]string{i.entry.Target, i.entry.ProfileName, i.entry.Result.Scan.NmapArgs}, " ")
-}
-
-func historyItems(entries []history.Entry) []list.Item {
-	items := make([]list.Item, 0, len(entries))
-	for _, entry := range entries {
-		items = append(items, historyItem{entry: entry})
-	}
-	return items
-}
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		return m, tea.Quit
 	}
 
+	keyString := msg.String()
+
+	// Keep the conventional interrupt key available in inputs and overlays.
+	if keyString == "ctrl+c" {
+		m.quitting = true
+		return m, tea.Quit
+	}
+
+	if m.showHistory {
+		switch keyString {
+		case "q", "esc", "h":
+			m.closeHistory()
+		case "enter":
+			if len(m.entries) > 0 {
+				m.syncHistorySelection()
+			}
+			m.showHistory = false
+			m.setFocus(focusHosts)
+		default:
+			m.handleHistoryKey(msg)
+		}
+		return m, nil
+	}
+
 	if m.showHelp {
-		switch msg.String() {
+		switch keyString {
 		case "q", "esc", "?":
 			m.showHelp = false
 		}
 		return m, nil
 	}
 
-	// Keep the conventional interrupt key available while editing input.
-	if msg.String() == "ctrl+c" {
-		m.quitting = true
-		return m, tea.Quit
-	}
-
 	// Help is deliberately available even while an input is focused. The
 	// other letter shortcuts remain ordinary text while editing a target.
-	if msg.String() == "?" {
+	if keyString == "?" {
 		m.showHelp = true
 		return m, nil
 	}
@@ -120,7 +103,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	keyString := msg.String()
 	switch keyString {
 	case "enter":
 		return m.startScan()
@@ -142,6 +124,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "r":
 		m.setFocus(focusTarget)
+		return m, nil
+	case "h":
+		m.openHistory()
 		return m, nil
 	case "p":
 		if len(m.profiles) > 0 {
@@ -176,13 +161,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.focus == focusHistory {
-		if handled, cmd := m.handleHistoryKey(msg); handled {
-			return m, cmd
-		}
-		return m, nil
-	}
-
 	if m.focus == focusDetail {
 		var cmd tea.Cmd
 		m.detail, cmd = m.detail.Update(msg)
@@ -203,32 +181,42 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) handleHistoryKey(msg tea.KeyMsg) (bool, tea.Cmd) {
-	keyString := msg.String()
-	switch keyString {
-	case "j":
-		m.history.CursorDown()
-		m.syncHistorySelection()
-		return true, nil
-	case "k":
-		m.history.CursorUp()
-		m.syncHistorySelection()
-		return true, nil
-	case "up", "down", "pgup", "pgdown":
-		var cmd tea.Cmd
-		m.history, cmd = m.history.Update(msg)
-		m.syncHistorySelection()
-		return true, cmd
+func (m *Model) openHistory() {
+	m.historyReturnFocus = m.focus
+	if len(m.entries) > 0 {
+		m.historyIndex = clamp(m.historyIndex, 0, len(m.entries)-1)
+	}
+	m.showHistory = true
+	m.setFocus(focusHistory)
+}
+
+func (m *Model) closeHistory() {
+	m.showHistory = false
+	returnFocus := m.historyReturnFocus
+	if returnFocus == focusHistory || returnFocus == focusFilter {
+		returnFocus = focusHosts
+	}
+	m.setFocus(returnFocus)
+}
+
+func (m *Model) handleHistoryKey(msg tea.KeyMsg) {
+	if len(m.entries) == 0 {
+		return
+	}
+
+	switch msg.String() {
+	case "j", "down":
+		m.historyIndex = min(m.historyIndex+1, len(m.entries)-1)
+	case "k", "up":
+		m.historyIndex = max(0, m.historyIndex-1)
+	case "pgdown":
+		m.historyIndex = min(m.historyIndex+5, len(m.entries)-1)
+	case "pgup":
+		m.historyIndex = max(0, m.historyIndex-5)
 	case "home", "g":
-		m.history.Select(0)
-		m.syncHistorySelection()
-		return true, nil
+		m.historyIndex = 0
 	case "end", "G":
-		m.history.Select(max(0, len(m.entries)-1))
-		m.syncHistorySelection()
-		return true, nil
-	default:
-		return false, nil
+		m.historyIndex = len(m.entries) - 1
 	}
 }
 
@@ -264,7 +252,7 @@ func (m *Model) handleTableKey(target *table.Model, msg tea.KeyMsg, hosts bool) 
 }
 
 func (m *Model) cycleFocus(direction int) {
-	focuses := []focusPane{focusTarget, focusPorts, focusHistory, focusHosts, focusPortsTable, focusDetail}
+	focuses := []focusPane{focusTarget, focusPorts, focusHosts, focusPortsTable, focusDetail}
 	currentIndex := 0
 	for index, focus := range focuses {
 		if focus == m.focus {
@@ -292,7 +280,7 @@ func (m *Model) setFocus(focus focusPane) {
 	case focusFilter:
 		m.filter.Focus()
 	case focusHistory:
-		// The list owns its own focus state; selection is driven by the model.
+		// History is rendered and navigated by the parent overlay.
 	case focusHosts:
 		m.hosts.Focus()
 	case focusPortsTable:
@@ -309,14 +297,8 @@ func (m *Model) syncHistorySelection() {
 		m.rebuildTables()
 		return
 	}
-	index := m.history.Index()
-	if index < 0 {
-		index = 0
-	}
-	if index >= len(m.entries) {
-		index = len(m.entries) - 1
-	}
-	m.current = &m.entries[index].Result
+	m.historyIndex = clamp(m.historyIndex, 0, len(m.entries)-1)
+	m.current = &m.entries[m.historyIndex].Result
 	m.rebuildTables()
 }
 
@@ -326,7 +308,7 @@ func (m *Model) rebuildTables() {
 	if m.current == nil {
 		m.hosts.SetRows(nil)
 		m.portsTable.SetRows(nil)
-		m.detail.SetContent("Run a scan to inspect hosts and ports.")
+		m.detail.SetContent(m.styles.muted.Render("Run a scan to inspect a host."))
 		return
 	}
 
@@ -346,16 +328,10 @@ func (m *Model) rebuildTables() {
 		if host.DisplayName() != address {
 			address = fmt.Sprintf("%s (%s)", host.DisplayName(), address)
 		}
-		latency := "-"
-		if host.Latency > 0 {
-			latency = host.Latency.Round(100 * time.Microsecond).String()
-		}
 		rows = append(rows, table.Row{
 			address,
-			m.stateText(host.State),
-			fmt.Sprintf("%d open", host.OpenPortCount()),
-			host.OS,
-			latency,
+			host.State,
+			fmt.Sprintf("%d", host.OpenPortCount()),
 		})
 	}
 	m.hosts.SetRows(rows)
@@ -385,7 +361,7 @@ func (m *Model) refreshPorts() {
 		rows = append(rows, table.Row{
 			fmt.Sprintf("%d", port.Number),
 			port.Protocol,
-			m.stateText(port.State),
+			port.State,
 			port.Service,
 			portVersion(port),
 		})
@@ -395,40 +371,54 @@ func (m *Model) refreshPorts() {
 }
 
 func (m *Model) refreshDetails() {
-	if m.current == nil || len(m.visible) == 0 {
-		m.detail.SetContent("No hosts matched the current filter.")
+	if m.current == nil {
+		m.detail.SetContent(m.styles.muted.Render("Run a scan to inspect a host."))
 		return
 	}
+	if len(m.visible) == 0 {
+		m.detail.SetContent(m.styles.muted.Render("No hosts match the current filter."))
+		return
+	}
+
 	hostIndex := clamp(m.hosts.Cursor(), 0, len(m.visible)-1)
 	host := m.visible[hostIndex]
+	row := func(label, value string) string {
+		return m.styles.detailKey.Render(padRight(label, 12)) + m.styles.value.Render(value)
+	}
+
 	lines := []string{
-		fmt.Sprintf("%s  [%s]", host.DisplayName(), host.State),
-		fmt.Sprintf("Addresses: %s", host.AddressList()),
+		m.styles.detailKey.Render(padRight("State", 12)) + m.stateText(host.State),
+		row("Addresses", host.AddressList()),
+		row("Open ports", fmt.Sprintf("%d", host.OpenPortCount())),
 	}
 	if len(host.Hostnames) > 0 {
-		lines = append(lines, "Hostnames: "+strings.Join(host.Hostnames, ", "))
+		lines = append(lines, row("Hostnames", strings.Join(host.Hostnames, ", ")))
 	}
 	if host.StateReason != "" {
-		lines = append(lines, "Reason: "+host.StateReason)
+		lines = append(lines, row("Reason", host.StateReason))
 	}
 	if host.OS != "" {
-		lines = append(lines, fmt.Sprintf("OS: %s (%d%%)", host.OS, host.OSAccuracy))
+		lines = append(lines, row("OS", fmt.Sprintf("%s (%d%%)", host.OS, host.OSAccuracy)))
+	}
+	if host.Latency > 0 {
+		lines = append(lines, row("Latency", host.Latency.Round(100*time.Microsecond).String()))
 	}
 	if len(m.visiblePorts) > 0 {
 		portIndex := clamp(m.portsTable.Cursor(), 0, len(m.visiblePorts)-1)
 		port := m.visiblePorts[portIndex]
-		lines = append(lines, "", fmt.Sprintf("Port %d/%s  [%s]", port.Number, port.Protocol, port.State))
+		portSummary := m.styles.value.Render(fmt.Sprintf("%d/%s", port.Number, port.Protocol)) + " " + m.stateText(port.State)
+		lines = append(lines, "", m.styles.detailKey.Render(padRight("Port", 12))+portSummary)
 		if port.Service != "" {
-			lines = append(lines, "Service: "+port.Service)
+			lines = append(lines, row("Service", port.Service))
 		}
-		if port.Product != "" || port.Version != "" {
-			lines = append(lines, "Product: "+strings.TrimSpace(port.Product+" "+port.Version))
+		if product := strings.TrimSpace(port.Product + " " + port.Version); product != "" {
+			lines = append(lines, row("Product", product))
 		}
 		if port.Reason != "" {
-			lines = append(lines, "Port reason: "+port.Reason)
+			lines = append(lines, row("Port reason", port.Reason))
 		}
 		if port.Extra != "" {
-			lines = append(lines, "Extra: "+port.Extra)
+			lines = append(lines, row("Extra", port.Extra))
 		}
 	}
 	m.detail.SetContent(strings.Join(lines, "\n"))

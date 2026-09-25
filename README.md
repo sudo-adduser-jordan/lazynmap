@@ -14,12 +14,12 @@ details without leaving the TUI.
 - Nmap XML parsing instead of scraping human-readable output
 - Quick TCP, service/version, host discovery, full TCP, and SYN profiles
 - Custom port specifications such as `22,80,443` or `1-1024`
-- Host and port tables with status colors and detail inspection
+- Compact host list with focused details and a larger port table
 - Text filtering across addresses, states, services, and versions
-- Cancelable scans with elapsed-time feedback
-- Local scan history stored as JSON
+- Cancelable scans with elapsed-time feedback and a visible command preview
+- Local scan history stored as JSON and shown in a keyboard-driven overlay
 - JSON export of the selected result
-- Responsive resizing and a built-in help screen
+- Responsive resizing and a built-in popup help screen
 
 ## Requirements
 
@@ -65,6 +65,7 @@ before a scan starts. Press `?` for the complete keybinding list.
 | `tab` / `shift+tab` | Move between panes |
 | `j` / `k`, arrows | Navigate hosts, ports, or history |
 | `/` | Filter results |
+| `h` | Open scan history |
 | `x` or `esc` | Cancel an active scan |
 | `e` | Export the selected result as JSON |
 | `?` | Toggle help |

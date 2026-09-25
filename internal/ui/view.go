@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/sudo-adduser-jordan/lazynmap/internal/history"
 	"github.com/sudo-adduser-jordan/lazynmap/internal/nmap"
 )
 
@@ -23,143 +24,243 @@ func (m Model) View() string {
 
 	header := m.headerView(width)
 	footer := m.footerView(width)
-	bodyHeight := height - lipgloss.Height(header) - lipgloss.Height(footer)
-	if bodyHeight < 14 {
-		bodyHeight = 14
-	}
+	bodyHeight := max(3, height-lipgloss.Height(header)-lipgloss.Height(footer))
+	body := m.bodyView(width, bodyHeight)
+	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 
-	var body string
-	if m.showHelp {
-		body = m.helpView(width, bodyHeight)
-	} else {
-		body = m.bodyView(width, bodyHeight)
+	switch {
+	case m.showHistory:
+		popup := m.historyPopup(width, height)
+		return placeOverlay(screen, popup, width, height)
+	case m.showHelp:
+		popup := m.helpPopup(width, height)
+		return placeOverlay(screen, popup, width, height)
+	default:
+		return screen
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
 func (m Model) headerView(width int) string {
 	profile := m.currentProfile()
-	state := m.stateLabel()
-	elapsed := m.elapsed().Round(time.Second).String()
-	title := m.styles.title.Render(" lazynmap ")
-	meta := m.styles.muted.Render(fmt.Sprintf("%s  ·  %s  ·  %s", profile.Name, state, elapsed))
-	header := lipgloss.JoinHorizontal(lipgloss.Top, title, " ", meta)
-
-	targetWidth := max(18, min(42, width/3-4))
-	portsWidth := max(14, min(28, width/5-2))
-	m.target.Width = targetWidth
-	m.ports.Width = portsWidth
-	config := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		m.target.View(),
-		"  ",
-		m.ports.View(),
-		"  ",
-		m.styles.label.Render("Profile "),
-		m.styles.accent.Render(profile.Name),
+	title := fmt.Sprintf(
+		"Scan · %s · %s · %s",
+		profile.Name,
+		m.stateLabel(),
+		m.elapsed().Round(time.Second),
 	)
-	config = truncate(config, max(20, width-2))
-	command := m.styles.muted.Render(truncate(m.commandPreview(), max(20, width-2)))
-	return lipgloss.JoinVertical(lipgloss.Left, header, config, command)
+
+	hint := "enter run · ? help"
+	if m.focus == focusFilter {
+		hint = "enter apply · esc clear"
+	}
+	content := m.scanFieldsView(width-2) + "\n" + m.styles.muted.Render("$ "+m.commandPreview())
+	focused := m.focus == focusTarget || m.focus == focusPorts || m.focus == focusFilter
+	return panelWithHint(m.styles, title, hint, content, width, scanPanelHeight, focused)
 }
 
-func (m Model) bodyView(width, height int) string {
-	leftWidth := clamp(width*28/100, 24, 38)
-	rightWidth := max(1, width-leftWidth)
-	left := m.historyPanel(leftWidth, height)
-	right := m.resultPanels(rightWidth, height)
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-}
-
-func (m Model) historyPanel(width, height int) string {
-	var content string
-	if len(m.entries) == 0 {
-		content = m.styles.muted.Render("No saved scans yet.\n\nPress r, enter a target, then enter.")
-	} else {
-		content = m.history.View()
-	}
-	title := "History"
-	if m.focus == focusHistory {
-		title += "  • focused"
-	}
-	return panel(m.styles, title, content, width, height, m.focus == focusHistory)
-}
-
-func (m Model) resultPanels(width, height int) string {
-	hostContent := "No hosts found."
-	if len(m.visible) > 0 {
-		hostContent = m.hosts.View()
-	}
-	portsContent := "No ports found."
-	if len(m.visiblePorts) > 0 {
-		portsContent = m.portsTable.View()
-	}
-	hostTitle := "Hosts"
-	if m.focus == focusHosts {
-		hostTitle += "  • focused"
-	}
-	portsTitle := "Ports"
-	if m.focus == focusPortsTable {
-		portsTitle += "  • focused"
-	}
-
-	// On very short terminals, keep the two result tables visible and hide
-	// the detail pane rather than allowing the bordered panels to overflow.
-	if height < 17 {
-		hostHeight := max(5, height/2)
-		portsHeight := max(5, height-hostHeight)
-		return lipgloss.JoinVertical(
-			lipgloss.Left,
-			panel(m.styles, hostTitle, hostContent, width, hostHeight, m.focus == focusHosts),
-			panel(m.styles, portsTitle, portsContent, width, portsHeight, m.focus == focusPortsTable),
+func (m Model) scanFieldsView(width int) string {
+	width = max(8, width)
+	if m.focus == focusFilter {
+		filter := m.filter
+		filter.Width = max(8, width-24)
+		return lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			filter.View(),
+			"  ",
+			m.styles.muted.Render("enter apply · esc clear"),
 		)
 	}
 
-	hostHeight := max(5, height*45/100)
-	portsHeight := max(5, height*30/100)
-	detailHeight := max(4, height-hostHeight-portsHeight)
-	detailTitle := "Details"
-	if m.focus == focusDetail {
-		detailTitle += "  • focused"
+	portsWidth := clamp(width*20/100, 10, 22)
+	targetWidth := clamp(width-portsWidth-19, 14, 46)
+	target := m.target
+	ports := m.ports
+	target.Width = targetWidth
+	ports.Width = portsWidth
+	line := lipgloss.JoinHorizontal(lipgloss.Top, target.View(), "  ", ports.View())
+	if ansi.StringWidth(line)+12 <= width {
+		line += "  " + m.styles.primary.Render("enter run")
 	}
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		panel(m.styles, hostTitle, hostContent, width, hostHeight, m.focus == focusHosts),
-		panel(m.styles, portsTitle, portsContent, width, portsHeight, m.focus == focusPortsTable),
-		panel(m.styles, detailTitle, m.detail.View(), width, detailHeight, m.focus == focusDetail),
+	return line
+}
+
+func (m Model) bodyView(width, height int) string {
+	layout := calculateBodyLayout(width, height)
+	hostContent := m.styles.muted.Render("No scan results yet.\n\nStart a scan above to inspect hosts and ports.")
+	if m.current != nil && len(m.visible) == 0 {
+		hostContent = m.styles.muted.Render("No hosts match the current filter.")
+	} else if len(m.visible) > 0 {
+		hostContent = m.hosts.View()
+	}
+	hostTitle := "Hosts"
+	if m.current != nil {
+		hostTitle = fmt.Sprintf("Hosts (%d/%d)", len(m.visible), len(m.current.Scan.Hosts))
+		if strings.TrimSpace(m.filter.Value()) == "" {
+			hostTitle = fmt.Sprintf("Hosts (%d)", len(m.visible))
+		}
+	}
+	left := panel(m.styles, hostTitle, hostContent, layout.leftWidth, height, m.focus == focusHosts)
+	right := m.resultPanels(layout)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+func (m Model) resultPanels(layout screenLayout) string {
+	hostLabel := "-"
+	portsTitle := "Ports"
+	if len(m.visible) > 0 {
+		host := m.visible[clamp(m.hosts.Cursor(), 0, len(m.visible)-1)]
+		hostLabel = host.DisplayName()
+		if host.PrimaryAddress() != hostLabel {
+			hostLabel = fmt.Sprintf("%s (%s)", hostLabel, host.PrimaryAddress())
+		}
+		portsTitle = fmt.Sprintf("Ports · %s (%d open)", hostLabel, host.OpenPortCount())
+	}
+
+	portsContent := m.styles.muted.Render("No ports to show.")
+	if m.current == nil {
+		portsContent = m.styles.muted.Render("Run a scan to discover open ports.")
+	} else if len(m.visible) == 0 {
+		portsContent = m.styles.muted.Render("No hosts match the current filter.")
+	} else if len(m.visiblePorts) == 0 {
+		portsContent = m.styles.muted.Render("No ports reported for this host.")
+	} else {
+		portsContent = m.portsTable.View()
+	}
+	portsPanel := panel(
+		m.styles,
+		portsTitle,
+		portsContent,
+		layout.rightWidth,
+		layout.portsHeight,
+		m.focus == focusPortsTable,
+	)
+
+	if layout.detailsHeight == 0 {
+		return portsPanel
+	}
+	detailsTitle := "Details"
+	if hostLabel != "-" {
+		detailsTitle = "Details · " + hostLabel
+	}
+	detailsPanel := panel(
+		m.styles,
+		detailsTitle,
+		m.detail.View(),
+		layout.rightWidth,
+		layout.detailsHeight,
+		m.focus == focusDetail,
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, detailsPanel, portsPanel)
+}
+
+func (m Model) historyPopup(width, height int) string {
+	popupWidth := min(68, max(12, width-4))
+	popupHeight := min(18, max(5, height-2))
+	contentWidth := max(1, popupWidth-2)
+	contentHeight := max(1, popupHeight-2)
+	rightHint := ""
+	content := m.styles.muted.Render("No saved scans yet.")
+	if len(m.entries) > 0 {
+		rightHint = fmt.Sprintf("%d/%d", m.historyIndex+1, len(m.entries))
+		visibleItems := max(1, contentHeight/2)
+		start := max(0, m.historyIndex-visibleItems+1)
+		if start > len(m.entries)-visibleItems {
+			start = max(0, len(m.entries)-visibleItems)
+		}
+
+		lines := make([]string, 0, visibleItems*2)
+		for index := start; index < len(m.entries) && index < start+visibleItems; index++ {
+			title, description := historyEntryText(m.entries[index])
+			if index == m.historyIndex {
+				lines = append(lines,
+					m.styles.selected.Render(padRight(truncate(title, contentWidth), contentWidth)),
+					m.styles.selectedDim.Render(padRight(truncate(description, contentWidth), contentWidth)),
+				)
+				continue
+			}
+			lines = append(lines,
+				m.styles.value.Render(truncate(title, contentWidth)),
+				m.styles.muted.Render(truncate(description, contentWidth)),
+			)
+		}
+		content = strings.Join(lines, "\n")
+	}
+	return panelWithHint(m.styles, "Scan history", rightHint, content, popupWidth, popupHeight, true)
+}
+
+func historyEntryText(entry history.Entry) (string, string) {
+	target := entry.Target
+	if target == "" {
+		target = "unknown target"
+	}
+	profile := entry.ProfileName
+	if profile == "" {
+		profile = "Custom"
+	}
+	finished := entry.FinishedAt
+	if finished.IsZero() {
+		finished = entry.Result.FinishedAt
+	}
+	return fmt.Sprintf("%s  ·  %s", target, profile), fmt.Sprintf(
+		"%s  ·  %d host(s)  ·  %d open",
+		finished.Local().Format("Jan 02 15:04"),
+		len(entry.Result.Scan.Hosts),
+		openPortCount(entry.Result.Scan.Hosts),
 	)
 }
 
-func (m Model) helpView(width, height int) string {
+func (m Model) helpPopup(width, height int) string {
+	popupWidth := min(64, max(18, width-4))
+	popupHeight := min(23, max(7, height-2))
+	heading := func(value string) string {
+		return m.styles.primary.Render(strings.ToUpper(value))
+	}
+	item := func(key, description string) string {
+		return "  " + m.styles.helpKey.Render(padRight(key, 12)) + description
+	}
 	lines := []string{
-		m.styles.panelTitle.Render("Keyboard shortcuts"),
+		heading("Scanning"),
+		item("enter", "Run the configured scan"),
+		item("x / esc", "Cancel an active scan"),
+		item("e", "Export the selected result as JSON"),
 		"",
-		"  enter       run the configured scan",
-		"  r           edit the target",
-		"  p           cycle scan profile",
-		"  tab         move between panes",
-		"  shift+tab   move to the previous pane",
-		"  /           filter hosts and ports",
-		"  x / esc     cancel an active scan",
-		"  e           export the selected result as JSON",
-		"  ?           close this help",
-		"  q           quit",
+		heading("Navigation"),
+		item("tab", "Move between panes"),
+		item("shift+tab", "Move to the previous pane"),
+		item("j / k", "Move down / up"),
+		item("g / G", "Jump to first / last row"),
+		item("/", "Filter hosts and ports"),
+		item("h", "Open history from a result pane"),
 		"",
-		m.styles.muted.Render("Profiles use nmap arguments directly and never invoke a shell."),
-		m.styles.muted.Render("Only scan hosts and networks you are authorized to test."),
+		heading("Scan setup"),
+		item("r", "Edit the target"),
+		item("p", "Cycle scan profile"),
+		"",
+		heading("General"),
+		item("esc / ?", "Close this help"),
+		item("q", "Quit from the main view"),
+		"",
+		m.styles.muted.Render("Only scan systems and networks you are authorized to test."),
 	}
 	content := strings.Join(lines, "\n")
-	return panel(m.styles, "Help", content, width, height, true)
+	return panel(m.styles, "Help · lazynmap", content, popupWidth, popupHeight, true)
 }
 
 func (m Model) footerView(width int) string {
-	status := m.statusView()
-	keys := m.styles.footer.Render(m.keys.footerHelp())
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		truncate(status, max(20, width-2)),
-		truncate(keys, max(20, width-2)),
-	)
+	overlay := ""
+	switch {
+	case m.showHistory:
+		overlay = "history"
+	case m.showHelp:
+		overlay = "help"
+	}
+
+	left := m.statusView()
+	if overlay != "" || m.statusMessage == "" {
+		left = m.styles.primary.Render(m.keys.footerHelp(m.focus, m.state, overlay))
+	}
+	right := m.styles.muted.Render("lazynmap")
+	return joinEdges(left, right, max(1, width))
 }
 
 func (m Model) statusView() string {
@@ -170,7 +271,7 @@ func (m Model) statusView() string {
 	case stateSuccess:
 		return m.styles.success.Render("✓ " + m.statusMessage)
 	case stateScanning:
-		return m.styles.accent.Render("⟳ " + m.statusMessage)
+		return m.styles.primary.Render("… " + m.statusMessage)
 	case stateCancelling:
 		return m.styles.warning.Render("… " + m.statusMessage)
 	case stateWarning:
@@ -225,26 +326,116 @@ func (m Model) commandPreview() string {
 }
 
 func panel(styles styles, title, content string, width, height int, focused bool) string {
-	if width < 4 {
-		width = 4
-	}
-	if height < 3 {
-		height = 3
-	}
-	box := styles.panel
-	if focused {
-		box = styles.focusedPanel
-	}
-	box = box.Width(max(1, width-2)).Height(max(1, height-2))
+	return panelWithHint(styles, title, "", content, width, height, focused)
+}
+
+func panelWithHint(styles styles, title, hint, content string, width, height int, focused bool) string {
+	width = max(4, width)
+	height = max(3, height)
+	innerWidth := width - 2
+	bodyHeight := height - 2
+
+	borderStyle := styles.border
 	titleStyle := styles.panelTitle
 	if focused {
-		titleStyle = titleStyle.Foreground(lipgloss.Color("#ffffff"))
+		borderStyle = styles.focusedBorder
+		titleStyle = styles.focusedTitle
 	}
-	body := titleStyle.Render(truncate(title, max(1, width-4)))
-	if content != "" {
-		body += "\n" + content
+
+	titleText := ""
+	leftWidth := 0
+	if title != "" && innerWidth >= 3 {
+		titleText = "─" + truncate(title, innerWidth-2) + " "
+		leftWidth = ansi.StringWidth(titleText)
 	}
-	return box.Render(body)
+	hintText := ""
+	rightWidth := 0
+	if hint != "" && leftWidth+2 <= innerWidth {
+		hintText = truncate(hint, innerWidth-leftWidth-2)
+		rightWidth = ansi.StringWidth(hintText) + 2
+	}
+	fillWidth := max(0, innerWidth-leftWidth-rightWidth)
+
+	var top strings.Builder
+	top.WriteString(borderStyle.Render("╭"))
+	top.WriteString(titleStyle.Render(titleText))
+	top.WriteString(borderStyle.Render(strings.Repeat("─", fillWidth)))
+	if hintText != "" {
+		top.WriteString(borderStyle.Render(" "))
+		top.WriteString(styles.panelHint.Render(hintText))
+		top.WriteString(borderStyle.Render("─"))
+	}
+	top.WriteString(borderStyle.Render("╮"))
+
+	lines := strings.Split(content, "\n")
+	body := make([]string, 0, bodyHeight)
+	for index := 0; index < bodyHeight; index++ {
+		line := ""
+		if index < len(lines) {
+			line = lines[index]
+		}
+		line = truncate(line, innerWidth)
+		body = append(body, padRight(line, innerWidth))
+	}
+
+	rendered := make([]string, 0, height)
+	rendered = append(rendered, top.String())
+	for _, line := range body {
+		rendered = append(rendered, borderStyle.Render("│")+line+borderStyle.Render("│"))
+	}
+	rendered = append(rendered, borderStyle.Render("╰"+strings.Repeat("─", innerWidth)+"╯"))
+	return strings.Join(rendered, "\n")
+}
+
+func placeOverlay(background, popup string, width, height int) string {
+	popupLines := strings.Split(popup, "\n")
+	popupWidth := lipgloss.Width(popup)
+	popupHeight := lipgloss.Height(popup)
+	x := max(0, (width-popupWidth)/2)
+	y := max(0, (height-popupHeight)/2)
+	backgroundLines := strings.Split(background, "\n")
+
+	lines := make([]string, 0, height)
+	for row := 0; row < height; row++ {
+		baseLine := ""
+		if row < len(backgroundLines) {
+			baseLine = backgroundLines[row]
+		}
+		if row < y || row >= y+popupHeight {
+			lines = append(lines, padRight(truncate(baseLine, width), width))
+			continue
+		}
+
+		popupLine := ""
+		if row-y < len(popupLines) {
+			popupLine = popupLines[row-y]
+		}
+		before := padRight(ansi.Cut(baseLine, 0, x), x)
+		center := padRight(ansi.Cut(popupLine, 0, popupWidth), popupWidth)
+		afterWidth := max(0, width-x-popupWidth)
+		after := padRight(ansi.Cut(baseLine, x+popupWidth, width), afterWidth)
+		lines = append(lines, before+center+after)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func joinEdges(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	right = truncate(right, width)
+	rightWidth := ansi.StringWidth(right)
+	if rightWidth >= width {
+		return right
+	}
+	left = truncate(left, width-rightWidth-1)
+	leftWidth := ansi.StringWidth(left)
+	return left + strings.Repeat(" ", width-leftWidth-rightWidth) + right
+}
+
+func padRight(value string, width int) string {
+	padding := max(0, width-ansi.StringWidth(value))
+	return value + strings.Repeat(" ", padding)
 }
 
 func truncate(value string, width int) string {

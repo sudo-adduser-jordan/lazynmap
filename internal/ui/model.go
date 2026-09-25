@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -44,6 +43,8 @@ const (
 	stateWarning
 )
 
+const scanPanelHeight = 4
+
 type Model struct {
 	width  int
 	height int
@@ -52,7 +53,7 @@ type Model struct {
 	ports  textinput.Model
 	filter textinput.Model
 
-	history      list.Model
+	historyIndex int
 	hosts        table.Model
 	portsTable   table.Model
 	detail       viewport.Model
@@ -75,10 +76,12 @@ type Model struct {
 	statusMessage string
 	statusAt      time.Time
 
-	showHelp bool
-	quitting bool
-	styles   styles
-	keys     keyMap
+	showHelp           bool
+	showHistory        bool
+	historyReturnFocus focusPane
+	quitting           bool
+	styles             styles
+	keys               keyMap
 }
 
 // NewModel creates the initial TUI model.
@@ -105,20 +108,25 @@ func NewModel() Model {
 	filter.CharLimit = 128
 	filter.Width = 28
 
+	for _, input := range []*textinput.Model{&target, &ports, &filter} {
+		input.PromptStyle = styles.label
+		input.PlaceholderStyle = styles.muted
+		input.TextStyle = styles.value
+	}
+
 	hostTable := table.New(
 		table.WithColumns([]table.Column{
 			{Title: "HOST", Width: 22},
-			{Title: "STATE", Width: 9},
-			{Title: "PORTS", Width: 8},
-			{Title: "OS", Width: 24},
-			{Title: "RTT", Width: 8},
+			{Title: "STATE", Width: 7},
+			{Title: "PORTS", Width: 5},
 		}),
 		table.WithHeight(8),
 		table.WithFocused(false),
 	)
 	hostStyles := table.DefaultStyles()
-	hostStyles.Header = hostStyles.Header.Bold(true).Foreground(lipgloss.Color("#a7a9b7"))
-	hostStyles.Selected = hostStyles.Selected.Background(lipgloss.Color("#302b63"))
+	hostStyles.Header = styles.muted.Bold(true)
+	hostStyles.Cell = lipgloss.NewStyle()
+	hostStyles.Selected = styles.selected
 	hostTable.SetStyles(hostStyles)
 
 	portsTable := table.New(
@@ -134,17 +142,8 @@ func NewModel() Model {
 	)
 	portsTable.SetStyles(hostStyles)
 
-	historyList := list.New(nil, list.NewDefaultDelegate(), 30, 12)
-	historyList.Title = "History"
-	historyList.SetShowHelp(false)
-	historyList.SetShowTitle(false)
-	historyList.SetShowStatusBar(false)
-	historyList.SetShowPagination(false)
-	historyList.SetFilteringEnabled(false)
-	historyList.DisableQuitKeybindings()
-
 	detail := viewport.New(40, 8)
-	detail.SetContent("Run a scan to inspect hosts and ports.")
+	detail.SetContent(styles.muted.Render("Run a scan to inspect a host."))
 
 	store, storeErr := history.NewStore()
 	entries := []history.Entry{}
@@ -161,7 +160,6 @@ func NewModel() Model {
 		target:        target,
 		ports:         ports,
 		filter:        filter,
-		history:       historyList,
 		hosts:         hostTable,
 		portsTable:    portsTable,
 		detail:        detail,
@@ -177,9 +175,9 @@ func NewModel() Model {
 		styles:        styles,
 		keys:          keys,
 	}
-	model.history.SetItems(historyItems(entries))
 	if len(entries) > 0 {
 		model.current = &model.entries[0].Result
+		model.historyIndex = 0
 		model.rebuildTables()
 	}
 	return model
@@ -247,6 +245,43 @@ func (m *Model) handleTick(msg tickMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+type screenLayout struct {
+	leftWidth     int
+	rightWidth    int
+	leftHeight    int
+	detailsHeight int
+	portsHeight   int
+}
+
+func calculateLayout(width, height int) screenLayout {
+	if width <= 0 {
+		width = 100
+	}
+	if height <= 0 {
+		height = 30
+	}
+	return calculateBodyLayout(width, max(3, height-scanPanelHeight-1))
+}
+
+func calculateBodyLayout(width, bodyHeight int) screenLayout {
+	leftWidth := clamp(width*30/100, 24, 42)
+	rightWidth := max(3, width-leftWidth)
+	layout := screenLayout{
+		leftWidth:   leftWidth,
+		rightWidth:  rightWidth,
+		leftHeight:  bodyHeight,
+		portsHeight: bodyHeight,
+	}
+	if bodyHeight < 7 {
+		return layout
+	}
+
+	layout.detailsHeight = clamp(bodyHeight*30/100, 5, 9)
+	layout.detailsHeight = min(layout.detailsHeight, bodyHeight-3)
+	layout.portsHeight = bodyHeight - layout.detailsHeight
+	return layout
+}
+
 func (m *Model) resize() {
 	if m.width <= 0 {
 		m.width = 100
@@ -255,56 +290,51 @@ func (m *Model) resize() {
 		m.height = 30
 	}
 
-	available := m.height - 7
-	if available < 12 {
-		available = 12
-	}
-	leftWidth := clamp(m.width*28/100, 24, 38)
-	rightWidth := max(1, m.width-leftWidth)
-	hostHeight := max(5, available*45/100)
-	portsHeight := max(5, available*30/100)
-	detailHeight := max(4, available-hostHeight-portsHeight)
-	if hostHeight+portsHeight+detailHeight > available {
-		detailHeight = max(4, available-hostHeight-portsHeight)
-	}
+	layout := calculateLayout(m.width, m.height)
+	leftInnerWidth := max(3, layout.leftWidth-2)
+	m.hosts.SetColumns(hostColumns(leftInnerWidth))
+	m.hosts.SetWidth(leftInnerWidth)
+	m.hosts.SetHeight(max(1, layout.leftHeight-2))
 
-	innerLeftWidth := max(10, leftWidth-4)
-	m.history.SetSize(innerLeftWidth, max(5, available-3))
-
-	rightInnerWidth := max(12, rightWidth-4)
-	m.hosts.SetColumns(hostColumns(rightInnerWidth))
-	m.hosts.SetWidth(rightInnerWidth)
-	m.hosts.SetHeight(max(3, hostHeight-3))
+	rightInnerWidth := max(3, layout.rightWidth-2)
 	m.portsTable.SetColumns(portColumns(rightInnerWidth))
 	m.portsTable.SetWidth(rightInnerWidth)
-	m.portsTable.SetHeight(max(3, portsHeight-3))
+	m.portsTable.SetHeight(max(1, layout.portsHeight-2))
 	m.detail.Width = rightInnerWidth
-	m.detail.Height = max(3, detailHeight-3)
+	m.detail.Height = max(1, layout.detailsHeight-2)
 }
 
 func hostColumns(width int) []table.Column {
-	stateWidth := 9
-	portsWidth := 8
-	rttWidth := 8
-	remaining := max(12, width-stateWidth-portsWidth-rttWidth)
-	hostWidth := max(12, remaining*55/100)
-	osWidth := max(8, remaining-hostWidth)
+	stateWidth := clamp(width*30/100, 5, 7)
+	portsWidth := clamp(width*18/100, 4, 5)
+	hostWidth := max(1, width-stateWidth-portsWidth)
 	return []table.Column{
 		{Title: "HOST", Width: hostWidth},
 		{Title: "STATE", Width: stateWidth},
 		{Title: "PORTS", Width: portsWidth},
-		{Title: "OS", Width: osWidth},
-		{Title: "RTT", Width: rttWidth},
 	}
 }
 
 func portColumns(width int) []table.Column {
-	portWidth := 7
-	protocolWidth := 6
-	stateWidth := 9
-	remaining := max(16, width-portWidth-protocolWidth-stateWidth)
-	serviceWidth := max(8, remaining*45/100)
-	versionWidth := max(8, remaining-serviceWidth)
+	if width < 34 {
+		portWidth := clamp(width*25/100, 4, 6)
+		stateWidth := clamp(width*30/100, 5, 7)
+		serviceWidth := max(1, width-portWidth-stateWidth)
+		return []table.Column{
+			{Title: "PORT", Width: portWidth},
+			{Title: "PROTO", Width: 0},
+			{Title: "STATE", Width: stateWidth},
+			{Title: "SERVICE", Width: serviceWidth},
+			{Title: "VERSION", Width: 0},
+		}
+	}
+
+	portWidth := 5
+	protocolWidth := 5
+	stateWidth := 7
+	remaining := max(1, width-portWidth-protocolWidth-stateWidth)
+	serviceWidth := clamp(remaining*42/100, 8, remaining-1)
+	versionWidth := max(1, remaining-serviceWidth)
 	return []table.Column{
 		{Title: "PORT", Width: portWidth},
 		{Title: "PROTO", Width: protocolWidth},
@@ -387,7 +417,7 @@ func (m *Model) handleScanFinished(msg scanFinishedMsg) (tea.Model, tea.Cmd) {
 	if m.store != nil {
 		m.entries = m.store.Add(m.lastQuery, msg.result)
 		m.store.Entries = m.entries
-		m.history.SetItems(historyItems(m.entries))
+		m.historyIndex = 0
 		entries := append([]history.Entry(nil), m.entries...)
 		cmds = append(cmds, saveHistory(m.store.Path, entries))
 	}
